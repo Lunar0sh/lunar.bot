@@ -58,10 +58,10 @@ Once the setup is complete, you can start the bot by running the following comma
 lunar.space uses slash commands for configuration.
 
     /set_channel
-    Sets the current channel for daily APOD posts. You must have "Manage Channels" permission to use this command.
+    Sets the current channel for daily APOD posts. You must have "Administrator" permission to use this command.
 
     /unset_channel
-    Stops the bot from sending daily APOD posts to this server. You must have "Manage Channels" permission.
+    Stops the bot from sending daily APOD posts to this server. You must have "Administrator" permission to use this command.
 
     /apod
     Manually fetches and posts the current APOD. You must have "Administrator" permission to use this command.
