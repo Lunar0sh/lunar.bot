@@ -223,10 +223,13 @@ async def apod(interaction: discord.Interaction):
         await interaction.followup.send("Sorry, I couldn't fetch the Picture of the Day from NASA right now.")
 
 
-# Other commands remain the same
 @bot.tree.command(name="set_channel", description="Sets this channel for daily APOD posts.")
-@app_commands.default_permissions(manage_channels=True)
 async def set_channel(interaction: discord.Interaction):
+    """Command for admins to set the APOD posting channel."""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You must be an administrator to use this command.", ephemeral=True)
+        return
+
     guild_id = str(interaction.guild.id)
     channel_id = interaction.channel.id
     apod_channels[guild_id] = channel_id
@@ -236,8 +239,12 @@ async def set_channel(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="unset_channel", description="Stops daily APOD posts in this server.")
-@app_commands.default_permissions(manage_channels=True)
 async def unset_channel(interaction: discord.Interaction):
+    """Command for admins to unset the APOD posting channel."""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You must be an administrator to use this command.", ephemeral=True)
+        return
+
     guild_id = str(interaction.guild.id)
     if guild_id in apod_channels:
         del apod_channels[guild_id]
@@ -283,8 +290,23 @@ async def check_and_post_apod():
         last_posted_date = current_apod_date
     else:
         # This can be noisy, so let's not print it every 5 minutes.
-        # print(f"APOD for {current_apod_date} has already been posted. Checking again in 5 minutes.")
         pass
+
+
+@check_and_post_apod.before_loop
+async def before_check_and_post_apod():
+    """Runs once before the task loop starts to prevent posting on restart."""
+    global last_posted_date
+    await bot.wait_until_ready()  # Wait for the bot to be fully ready
+    print("Priming APOD cache before starting the loop...")
+
+    # Fetch the current APOD to set the initial date, but don't post it.
+    initial_apod_data = await fetch_apod()
+    if initial_apod_data:
+        last_posted_date = initial_apod_data.get('date')
+        print(f"Initial APOD date set to: {last_posted_date}. Bot will not post this on startup.")
+    else:
+        print("Could not fetch initial APOD data. The bot will try again in 5 minutes.")
 
 
 # --- RUN THE BOT ---
