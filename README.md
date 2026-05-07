@@ -1,4 +1,4 @@
-# So you wanna Self-Host a APOD Bot?
+# So you wanna Self-Host an APOD Bot?
 Well.. here you go!
 
 Welcome to the Lunar.bot APOD project. This is a robust, caching, and media-compressing Discord bot that brings the cosmos directly to your servers and DMs using the official NASA API. 
