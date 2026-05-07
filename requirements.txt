@@ -5,3 +5,5 @@ tzdata
 psutil
 pynacl
 davey
+ffmpeg
+Pillow

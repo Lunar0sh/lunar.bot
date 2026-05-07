@@ -10,7 +10,10 @@ import psutil
 import time
 import hashlib
 import logging
+import sys
+import subprocess
 from urllib.parse import urlparse
+from PIL import Image
 from dotenv import load_dotenv
 
 # --- Logging Setup ---
@@ -20,13 +23,12 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("Lunar.Bot")
+logging.getLogger("discord").setLevel(logging.ERROR)
 
-# Load Environment Variables
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 NASA_API_KEY = os.getenv("NASA_API_KEY")
 
-# Constants
 DEV_GUILD_ID = 1209920360565182506
 DEV_GUILD = discord.Object(id=DEV_GUILD_ID)
 OWNER_ID = 1390299961500897322
@@ -34,13 +36,14 @@ CONFIG_FILE = "config.json"
 CACHE_FILE = "cache.json"
 CACHE_DIR = "cached"
 START_TIME = time.time()
-DISCORD_FILE_LIMIT = 25 * 1024 * 1024  # 25 MB Limit for standard bots
 
-# Design Constants
+# Limits
+TARGET_DISCORD_SIZE = 24 * 1024 * 1024
+MAX_DOWNLOAD_SIZE = 150 * 1024 * 1024
+
 NASA_LOGO_URL = "https://cdn.freebiesupply.com/logos/large/2x/nasa-2-logo-png-transparent.png"
 SPACE_COLORS = [0x0B3D91, 0x1B1B3A, 0x4B0082, 0x8A2BE2, 0xFF4500, 0xFFD700, 0x00CED1, 0x2F4F4F]
 
-# Ensure cache directory exists
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
     logger.info(f"Created cache directory: {CACHE_DIR}")
@@ -52,8 +55,13 @@ class APODBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        self.tree.copy_global_to(guild=DEV_GUILD)
+        # 1. Sync für Dev-Server (überschreibt die Server-Duplikate und hinterlässt nur /nuke)
         await self.tree.sync(guild=DEV_GUILD)
+
+        # 2. Globaler Sync für alle Server und DMs
+        await self.tree.sync()
+        logger.info("Global commands synced. Duplicates resolved.")
+
         daily_apod_task.start()
 
 
@@ -81,60 +89,184 @@ def get_daily_color():
 
 
 def cleanup_old_cache():
-    """Löscht Dateien aus dem Cache, die älter als 7 Tage sind."""
     now = time.time()
     deleted_count = 0
     for filename in os.listdir(CACHE_DIR):
         filepath = os.path.join(CACHE_DIR, filename)
         if os.path.isfile(filepath):
-            # Prüft das Erstellungs-/Änderungsdatum
             if os.stat(filepath).st_mtime < now - 7 * 86400:
-                os.remove(filepath)
-                deleted_count += 1
-                logger.info(f"Deleted old cache file: {filename}")
+                try:
+                    os.remove(filepath)
+                    deleted_count += 1
+                    logger.info(f"Deleted old cache file: {filename}")
+                except Exception as e:
+                    logger.error(f"Failed to delete {filename}: {e}")
     if deleted_count > 0:
         logger.info(f"Cleanup finished. Removed {deleted_count} old files.")
 
 
+def compress_media(filepath: str, ext: str) -> str | None:
+    compressed_path = filepath.replace(ext, f"_compressed{ext}")
+
+    if os.path.exists(compressed_path) and os.path.getsize(compressed_path) <= TARGET_DISCORD_SIZE:
+        return compressed_path
+
+    logger.info(f"File exceeds 24MB. Starting aggressive compression for {filepath}...")
+
+    try:
+        if ext.lower() in ['.jpg', '.jpeg', '.png']:
+            img = Image.open(filepath)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+
+            quality = 85
+            img.save(compressed_path, "JPEG", quality=quality)
+
+            while os.path.getsize(compressed_path) > TARGET_DISCORD_SIZE and quality > 10:
+                quality -= 10
+                img.save(compressed_path, "JPEG", quality=quality)
+
+        elif ext.lower() in ['.mp4', '.mov', '.webm']:
+            cmd = [
+                "ffmpeg", "-y", "-i", filepath,
+                "-vf", "scale=-2:480",
+                "-r", "24",
+                "-vcodec", "libx264",
+                "-crf", "35",
+                "-preset", "fast",
+                "-acodec", "aac",
+                "-b:a", "64k",
+                compressed_path
+            ]
+
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            if result.returncode != 0:
+                logger.error(f"FFMPEG Error Output:\n{result.stderr}")
+                return None
+
+        if os.path.exists(compressed_path):
+            new_size = os.path.getsize(compressed_path)
+            if new_size <= TARGET_DISCORD_SIZE:
+                logger.info(f"Compression successful. New size: {new_size / (1024 * 1024):.2f} MB")
+                return compressed_path
+            else:
+                logger.warning(
+                    f"Compression failed to reach target. Resulting size is still {new_size / (1024 * 1024):.2f} MB.")
+                os.remove(compressed_path)
+                return None
+        else:
+            logger.warning("FFMPEG finished silently, but output file is missing.")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error during compression: {e}")
+        if os.path.exists(compressed_path):
+            os.remove(compressed_path)
+        return None
+
+
+async def safe_send(interaction: discord.Interaction = None, channel: discord.TextChannel = None,
+                    original_url: str = None, **kwargs):
+    try:
+        if interaction:
+            await interaction.followup.send(**kwargs)
+        elif channel:
+            # Channel objects do not support the 'ephemeral' argument, so we remove it if present
+            kwargs.pop('ephemeral', None)
+            await channel.send(**kwargs)
+    except discord.errors.HTTPException as e:
+        if e.status == 413:
+            logger.warning("Discord Server Limit reached (413). Switching to fallback URL.")
+            if "file" in kwargs:
+                del kwargs["file"]
+            kwargs[
+                "content"] = f"**Today's APOD is a file that is still too large for Discord even after compression!**\nHere is the direct link: {original_url}"
+
+            if interaction:
+                await interaction.followup.send(**kwargs)
+            elif channel:
+                kwargs.pop('ephemeral', None)
+                await channel.send(**kwargs)
+        else:
+            logger.error(f"Discord API Error during send: {e}")
+
+
 async def download_media(url: str, date_str: str) -> str | None:
-    """Lädt das Bild/Video in den cached Ordner, sofern es nicht YouTube ist."""
     if "youtube.com" in url or "youtu.be" in url or "vimeo.com" in url:
-        return None  # Externe Plattformen verarbeiten wir als Link
+        return None
 
     parsed_url = urlparse(url)
     ext = os.path.splitext(parsed_url.path)[1]
     if not ext:
-        ext = ".jpg"  # Fallback
+        ext = ".jpg"
 
     filepath = os.path.join(CACHE_DIR, f"{date_str}{ext}")
+    compressed_path = filepath.replace(ext, f"_compressed{ext}")
 
+    if os.path.exists(compressed_path):
+        return compressed_path
     if os.path.exists(filepath):
-        logger.info(f"Serving media from cache: {filepath}")
-        return filepath
+        if os.path.getsize(filepath) <= TARGET_DISCORD_SIZE:
+            return filepath
+        else:
+            compressed_result = compress_media(filepath, ext)
+            if compressed_result:
+                return compressed_result
 
     logger.info(f"Downloading new media from NASA: {url}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    custom_timeout = aiohttp.ClientTimeout(total=1800)
+
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=headers, timeout=custom_timeout) as session:
             async with session.get(url) as response:
                 if response.status == 200:
-                    content_length = int(response.headers.get('Content-Length', 0))
-                    if content_length > DISCORD_FILE_LIMIT:
-                        logger.warning(f"File too large ({content_length} bytes). Skipping download.")
+                    total_size = int(response.headers.get('Content-Length', 0))
+
+                    if total_size > MAX_DOWNLOAD_SIZE:
+                        logger.warning(
+                            f"File exceeds maximum download size ({total_size / 1024 / 1024:.2f} MB). Skipping.")
                         return None
 
-                    data = await response.read()
-                    if len(data) > DISCORD_FILE_LIMIT:
-                        logger.warning("Downloaded data exceeds Discord limit. Discarding.")
-                        return None
-
+                    downloaded_size = 0
                     with open(filepath, 'wb') as f:
-                        f.write(data)
-                    logger.info(f"Successfully cached media to {filepath}")
+                        async for chunk in response.content.iter_chunked(1024 * 512):
+                            downloaded_size += len(chunk)
+                            f.write(chunk)
+
+                            if total_size > 0:
+                                percent = (downloaded_size / total_size) * 100
+                                bar_length = 40
+                                filled = int(bar_length * (downloaded_size / total_size))
+                                bar = '#' * filled + '-' * (bar_length - filled)
+                                sys.stdout.write(
+                                    f"\r[DOWNLOAD] [{bar}] {percent:.1f}% ({downloaded_size / (1024 * 1024):.2f} MB / {total_size / (1024 * 1024):.2f} MB)")
+                            else:
+                                sys.stdout.write(f"\r[DOWNLOAD] {downloaded_size / (1024 * 1024):.2f} MB downloaded...")
+                            sys.stdout.flush()
+
+                    sys.stdout.write("\n")
+                    logger.info(f"Download complete: {filepath}")
+
+                    if downloaded_size > TARGET_DISCORD_SIZE:
+                        compressed_result = compress_media(filepath, ext)
+                        if compressed_result:
+                            return compressed_result
+                        else:
+                            return None
+
                     return filepath
                 else:
-                    logger.error(f"Failed to download media. Status: {response.status}")
+                    logger.error(f"Failed to download media. NASA API returned status {response.status}")
     except Exception as e:
-        logger.error(f"Error downloading media: {e}")
+        sys.stdout.write("\n")
+        logger.error(f"Error during media download: {type(e).__name__} - {e}")
+        if os.path.exists(filepath):
+            os.remove(filepath)
 
     return None
 
@@ -145,21 +277,18 @@ async def fetch_apod_with_cache(params=None):
     if is_standard_call:
         cache = load_json(CACHE_FILE)
         today = datetime.date.today().isoformat()
-
         if cache.get("date") == today:
-            logger.info("Serving APOD JSON data from cache.")
             return cache.get("data")
 
     url = "https://api.nasa.gov/planetary/apod"
     request_params = params.copy() if params else {}
     request_params['api_key'] = NASA_API_KEY
 
-    logger.info(f"Fetching APOD JSON data from NASA API...")
+    logger.info("Fetching fresh APOD JSON data from NASA API...")
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=request_params) as response:
             if response.status == 200:
                 data = await response.json()
-
                 if is_standard_call:
                     image_url = data.get("url", "")
                     url_hash = hashlib.md5(image_url.encode()).hexdigest()
@@ -179,7 +308,7 @@ class APODView(discord.ui.View):
         if hdurl:
             self.add_item(discord.ui.Button(label="View Full Resolution", url=hdurl, style=discord.ButtonStyle.link))
         if video_url:
-            self.add_item(discord.ui.Button(label="Open Video Link", url=video_url, style=discord.ButtonStyle.link))
+            self.add_item(discord.ui.Button(label="Open Source URL", url=video_url, style=discord.ButtonStyle.link))
 
 
 async def build_apod_message(data):
@@ -200,11 +329,9 @@ async def build_apod_message(data):
     embed.set_author(name="NASA API | APOD", icon_url=NASA_LOGO_URL)
     embed.set_footer(text=f"Date: {date} | Bot By Lunar_sh")
 
-    content = None
     view = None
     file = None
 
-    # Versuch, die Datei lokal zu cachen
     local_filepath = await download_media(url, date)
 
     if local_filepath:
@@ -215,21 +342,16 @@ async def build_apod_message(data):
             embed.set_image(url=f"attachment://{filename}")
             view = APODView(hdurl=hdurl)
         elif media_type == "video":
-            content = "**Today's APOD is a local video:**"
             view = APODView(video_url=url)
-            # Bei Video setzen wir kein set_image. Das File wird normal gesendet und Discord baut den Player.
-
     else:
-        # Fallback auf reines Verlinken, falls Datei zu groß oder YouTube Link
-        logger.info("Serving APOD via direct URL links (Fallback or External Platform).")
+        logger.info("Serving APOD via direct URL links.")
         if media_type == "image":
             embed.set_image(url=url)
             view = APODView(hdurl=hdurl)
         elif media_type == "video":
-            content = f"**Today's APOD is a video:**\n{url}"
             view = APODView(video_url=url)
 
-    return content, embed, view, file
+    return embed, view, file, url, media_type
 
 
 # --- Custom Checks ---
@@ -249,42 +371,72 @@ def is_owner():
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def get_apod(interaction: discord.Interaction):
-    await interaction.response.defer()
-    logger.info(f"Command /apod executed by {interaction.user.name}")
+    config = load_json(CONFIG_FILE)
+    apod_channel = config.get("apod_channel")
+
+    # Sichtbarkeit festlegen: Privat, wenn auf einem Server UND falscher Channel
+    is_ephemeral = interaction.guild is not None and interaction.channel_id != apod_channel
+
+    await interaction.response.defer(ephemeral=is_ephemeral)
+    logger.info(f"Command /apod executed by {interaction.user.name} (Ephemeral: {is_ephemeral})")
 
     data = await fetch_apod_with_cache()
     if not data:
-        await interaction.followup.send("Failed to reach NASA API.")
+        await interaction.followup.send("Failed to reach NASA API.", ephemeral=is_ephemeral)
         return
 
-    content, embed, view, file = await build_apod_message(data)
+    embed, view, file, original_url, media_type = await build_apod_message(data)
 
-    kwargs = {"content": content, "embed": embed, "view": view}
-    if file:
-        kwargs["file"] = file
+    if media_type == "video":
+        await safe_send(interaction=interaction, embed=embed, view=view, ephemeral=is_ephemeral)
 
-    await interaction.followup.send(**kwargs)
+        video_kwargs = {"ephemeral": is_ephemeral}
+        if file:
+            video_kwargs["file"] = file
+            video_kwargs["content"] = "**Today's Video:**"
+        else:
+            video_kwargs["content"] = f"**Today's Video:**\n{original_url}"
+
+        await safe_send(interaction=interaction, original_url=original_url, **video_kwargs)
+    else:
+        kwargs = {"embed": embed, "view": view, "ephemeral": is_ephemeral}
+        if file: kwargs["file"] = file
+        await safe_send(interaction=interaction, original_url=original_url, **kwargs)
 
 
 @bot.tree.command(name="random", description="Fetches a random APOD from the archives.")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def random_apod(interaction: discord.Interaction):
-    await interaction.response.defer()
-    logger.info(f"Command /random executed by {interaction.user.name}")
+    config = load_json(CONFIG_FILE)
+    apod_channel = config.get("apod_channel")
+
+    # Sichtbarkeit festlegen
+    is_ephemeral = interaction.guild is not None and interaction.channel_id != apod_channel
+
+    await interaction.response.defer(ephemeral=is_ephemeral)
+    logger.info(f"Command /random executed by {interaction.user.name} (Ephemeral: {is_ephemeral})")
 
     data = await fetch_apod_with_cache(params={"count": 1})
     if not data:
-        await interaction.followup.send("Failed to fetch random APOD.")
+        await interaction.followup.send("Failed to fetch random APOD.", ephemeral=is_ephemeral)
         return
 
-    content, embed, view, file = await build_apod_message(data)
+    embed, view, file, original_url, media_type = await build_apod_message(data)
 
-    kwargs = {"content": content, "embed": embed, "view": view}
-    if file:
-        kwargs["file"] = file
-
-    await interaction.followup.send(**kwargs)
+    if media_type == "video":
+        await safe_send(interaction=interaction, embed=embed, view=view, ephemeral=is_ephemeral)
+        video_kwargs = {"ephemeral": is_ephemeral}
+        if file:
+            video_kwargs["file"] = file
+            video_kwargs["content"] = "**Random Video from the Archives:**"
+        else:
+            video_kwargs["content"] = f"**Random Video from the Archives:**\n{original_url}"
+        await safe_send(interaction=interaction, original_url=original_url, **video_kwargs)
+    else:
+        kwargs = {"embed": embed, "view": view, "ephemeral": is_ephemeral}
+        if file: kwargs["file"] = file
+        await safe_send(interaction=interaction, original_url=original_url, **kwargs)
 
 
 @bot.tree.command(name="apod_setup", description="Sets the daily drop channel (Server only).")
@@ -317,7 +469,6 @@ async def bot_status(interaction: discord.Interaction):
     embed.add_field(name="CPU", value=f"`{cpu_usage}%`", inline=True)
     embed.add_field(name="RAM", value=f"`{ram_usage}`", inline=False)
 
-    # Calculate Cache Size
     cache_size = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in os.listdir(CACHE_DIR) if
                      os.path.isfile(os.path.join(CACHE_DIR, f)))
     cache_size_mb = cache_size / (1024 * 1024)
@@ -332,18 +483,20 @@ async def bot_status(interaction: discord.Interaction):
 async def nuke_commands(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     logger.info("Executing NUKE command...")
+
     bot.tree.clear_commands(guild=None)
     await bot.tree.sync(guild=None)
+
     for guild in bot.guilds:
-        try:
-            bot.tree.clear_commands(guild=guild)
-            await bot.tree.sync(guild=guild)
-        except:
-            pass
-    bot.tree.copy_global_to(guild=DEV_GUILD)
-    await bot.tree.sync(guild=DEV_GUILD)
-    logger.info("NUKE command finished.")
-    await interaction.followup.send(content="Nuke complete. All old commands cleared.")
+        if guild.id != DEV_GUILD_ID:
+            try:
+                bot.tree.clear_commands(guild=guild)
+                await bot.tree.sync(guild=guild)
+            except:
+                pass
+
+    logger.info("NUKE command finished. Please restart the bot to rebuild local command trees.")
+    await interaction.followup.send(content="Nuke complete. All old commands cleared. Please restart the bot now.")
 
 
 # --- Tasks ---
@@ -374,14 +527,25 @@ async def daily_apod_task():
         logger.error("Failed to fetch data for daily drop.")
         return
 
-    content, embed, view, file = await build_apod_message(data)
+    embed, view, file, original_url, media_type = await build_apod_message(data)
 
-    kwargs = {"content": content, "embed": embed, "view": view}
-    if file:
-        kwargs["file"] = file
+    if media_type == "video":
+        await safe_send(channel=channel, embed=embed, view=view)
 
-    await channel.send(**kwargs)
-    logger.info(f"Daily APOD successfully dropped in channel {channel_id}.")
+        video_kwargs = {}
+        if file:
+            video_kwargs["file"] = file
+            video_kwargs["content"] = "**Today's Video:**"
+        else:
+            video_kwargs["content"] = f"**Today's Video:**\n{original_url}"
+
+        await safe_send(channel=channel, original_url=original_url, **video_kwargs)
+    else:
+        kwargs = {"embed": embed, "view": view}
+        if file: kwargs["file"] = file
+        await safe_send(channel=channel, original_url=original_url, **kwargs)
+
+    logger.info(f"Daily APOD processing finished for channel {channel_id}.")
 
 
 @bot.event
@@ -390,4 +554,4 @@ async def on_ready():
     logger.info(f"Connected to {len(bot.guilds)} guilds.")
 
 
-bot.run(TOKEN)
+bot.run(TOKEN, log_handler=None)
